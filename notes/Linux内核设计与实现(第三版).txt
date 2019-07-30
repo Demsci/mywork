@@ -396,16 +396,246 @@
 	空间（实际上指向地址空间的mm指针被设置为NULL）。它们只在内核空间运行，从来不切换
 	到用户空间去。内核进程和普通进程一样，可以被调度，也可以被抢占。
 			
+		Linux确实会把一些任务交给内核线程去做，像flush和ksofirqd这些任务就是明显的例子。
+	在装有Linux系统的机子上运行ps -ef命令，你可以看到内核线程，有很多！这些线程在系统启
+	动时由另外一些内核线程创建。实际上，内核线程也只能由其他内核线程创建。内核是通过从
+	kthreadd内核进程中衍生出所有新的内核线程来自动处理这一点的。在<linux/kthread.h>中申明
+	有接口，于是，从现有内核线程中创建一个新的内核线程的方法如下：
+	
+		struct task_struct *kthread_create(int (*threadfn) (void *data),
+										   void *data,
+										   const char namefmt[],
+										   ...)
+										   
+		新的任务是由kthread内核进程通过clone()系统调用而创建的。新的进程将运行threadfn
+	函数，给其传递的参数为data。进程会被命名为namefmt，namefmt接受可变参数列表类似于
+	printf()的格式化参数。新创建的进程处于不可运行状态，如果不通过调用wake_up_process()
+	明确地唤醒它，它不会主动运行。创建一个进程并让它运行起来，可以通过调用kthread_run()
+	来达到：
+	
+		struct task_struct *kthread_run(int (*threadfn) (void *data),
+										void *data,
+										const char namefmt[],
+										...)
+										
+		这个例程是以宏实现的，只是简单地调用了kthread_create()和wake_up_process()：
+		
+		#define kthread_run(threadfn, data, namefmt, ...)						\
+		({																		\
+			struct task_struct *k;												\
+			k = kthread_create(threadfn, data, namefmt, ## __VA_ARGS__);		\
+			if (!IS_ERR(k))														\
+				wake_up_process(k);												\
+			k;																	\
+		})
+		
+		内核线程启动后就一直运行直到调用do_exit()退出，或者内核的其他部分调用kthread_
+	stop()退出，传递给kthread_stop()的参数为kthread_create()函数返回的task_struct结构的地址：
+	
+		int kthread_stop(struct task_struct *k)
+		
+		我们将在以后的内容中详细讨论具体的内核线程。
+		
+		
+3.5 进程终结
+
+		虽然让人伤感，但进程终归是要终结的。当一个进程终结的时候，内核必须释放它所占有的资源
+	并把这一不幸告知其父进程。
+	
+		一般来说，进程的析构是自身引起的。它发生在进程调用exit()系统调用时，既可能显式
+	地调用这个系统调用，也可能隐式地从某个程序的主函数返回（其实C语言编译器会在main()
+	函数的返回点后面放置调用exit()的代码）。当进程接受到它既不能处理也不能忽略的信号或异
+	常时，它还可能被动地终结。不管进程是怎么终结的，该任务大部分都要靠do_exit()（定义于
+	kernel/exit.c）来完成，它要做下面这些烦琐的工作：
+	
+		1) 将task_struct中的标志成员设置为PF_EXITING。
+		2) 调用del_timer_sync()删除任一内核定时器。根据返回的结果，它确保没有定时器在排
+	队，也没有定时器处理程序在运行。
+		3) 如果BSD的进程记账功能是开启的，do_exit()调用acct_update_integrals()来输出记账
+	信息。
+		4) 然后调用exit_mm()函数释放进程占用的mm_struct，如果没有别的进程使用它们（也就
+	是说，这个地址空间没有被共享），就彻底释放它们。
+		5) 接下来调用sem__exit()函数。如果进程排队等候IPC信号，它则离开队列。
+		6) 调用exit_files()和exit_fs()，以分别递减文件描述符、文件系统数据的引用计数。如果
+	其中某个引用计数的数值降为零，那么就代表没有进程在使用相应的资源，此时可以释放。
+		7) 接着把存放在task_struct的exit_code成员中的任务退出代码置为由exit()提供的退出代
+	码，或者去完成任何其他由内核机制规定的退出动作。退出代码存放在这里供父进程随时检索。
+		8) 调用exit_notify()向父进程发送信号，给子进程重新找养父，养父为线程组中的其
+	他线程或者为init进程，并把进程状态（存放在task_struct结构的exit_state中）设成EXIT_
+	ZOMBIE。
+		9) do_exit()调用schedule()切换到新的进程（参看第4章）。因为处于EXIT_ZOMBIE状态
+	的进程不会再被调度，所以这是进程所执行的最后一段代码。do_exit()永不返回。
+	
+		至此，与进程相关联的所有资源都被释放掉了（假设该进程是这些资源的唯一使用者）。进
+	程不可运行（实际上也没有地址空间让它运行）并处于EXIT_ZOMBIE退出状态。它占用的所
+	有内存就是内核栈、thread_info结构和task_struct结构。此时进程存在的唯一目的就是向它的父
+	进程提供信息。父进程检索到信息后，或者通知内核那是无关的信息后，由进程所持有的剩余内
+	存被释放，归还给系统使用。
+	
+	
+3.5.1 删除进程描述符
+
+		在调用了do_exit()之后，尽管线程已经僵死不能再运行了，但是系统还保留了它的进程描
+	述符。前面说过，这样做可以让系统有办法在子进程终结后仍能获得它的信息。因此，进程终结
+	时所需的清理工作和进程描述符的删除被分开执行。在父进程获得已终结的子进程的信息后，或
+	者通知内核它并不关注那些信息后，子进程的task_struct结构才被释放。
+	
+		wait()这一族函数都是通过唯一（但是很复杂）的一个系统调用wait4()来实现的。它的标
+	准动作是挂起调用它的进程，直到其中的一个子进程退出，此时函数会返回该子进程的PID。此
+	外，调用该函数时提供的指针会包含子函数退出时的退出码。
+	
+		当最终需要释放进程描述符时，release_task()会被调用，用以完成以下工作：
+		
+		1) 它调用__exit_signal()，该函数调用_unhash_process()，后者又调用detach_pid()从pidhash
+		   上删除该进程，同时也要从任务列表中删除该进程。
+		   
+		2) _exit_signal()释放目前僵死进程所使用的所有剩余资源，并进行最终统计和记录。
+		
+		3) 如果这个进程是线程组最后一个进程，并且领头进程已经死掉，那么release_task()就要
+		   通知僵死的领头进程的父进程。
+		   
+		4) release_task()调用put_task_struct()释放进程内核栈和thread_info结构所占的页，并释放
+		   task_struct所占的slab高速缓存。
+		   
+		至此，进程描述符和所有进程独享的资源就全部释放掉了。
+		
+		
+3.5.2 孤儿进程造成的进退维谷
+
+		如果父进程在子进程之前退出，必须有机制来保证子进程能找到一个新的父亲，否则这些成
+	为孤儿的进程就会在退出时永远处于僵死状态，白白地耗费内存。前面的部分已经有所暗示，对
+	于这个问题，解决方法是给子进程在当前线程组内找一个线程作为父亲，如果不行，就让init做
+	它们的父进程。在do_exit()中会调用exit_notify()，该函数会调用forget_original_parent()，而后
+	者会调用find_new_reaper()来执行寻父过程：
+	
+		static struct task_struct *find_new_reaper(struct task_struct *father)
+		{
+			struct pid_namespace *pid_ns = task_active_pid_ns(father);
+			struct task_struct *thread;
+			
+			thread = father;
+			while_each_thread(father, thread) {
+				if (thread->flags & PF_EXITING)
+					continue;
+				if (unlikely(pid_ns->child_reaper == father))
+					pid_ns->child_reaper = thread;
+				return thread;
+			}
+			
+			if (unlikely(pid_ns->child_reaper == father)) {
+				write_unlock_irq(&tasklist_lock);
+				if (unlikely(pid_ns == &init_pid_ns))
+					panic("Attempted to kill init!");
+					
+					zap_pid_ns_processes(pid_ns);
+					write_lock_irq(&tasklist_lock);
+					pid_ns->child_reaper = init_pid_ns.child_reaper;
+			}
+			return pid_ns->child_reaper;
+		}
+		
+		这段代码试图找到进程所在的线程组在内的其他进程。如果线程组内没有其他的进程，它就找
+	到并返回的是init进程。现在，给子进程找到合适的养父进程了，只需要遍历所有子进程并为它
+	们设置新的父进程：
+	
+		reaper = find_new_reaper(father);
+		list_for_each_entry_safe(p, n, &father->children, sibling) {
+			p->real_parent = reaper;
+			if (p->parent == father) {
+				BUG_ON(p->ptrace);
+				p->parent = p->real_parent;
+			}
+			reparent_thread(p, father);
+		}
+		
+		然后调用ptrace_exit_finish()同样进行新的寻父过程，不过这次是给ptraced的子进程寻
+	找父亲。
+	
+		void exit_ptrace(struct task_struct *tracer)
+		{
+			struct task_struct *p, *n;
+			LIST_HEAD(ptrace_dead);
+			
+			write_lock_irq(&tasklist_lock);
+			list_for_each_entry_safe(p, n, &tracer->ptraced, ptrace_entry) {
+				if (__ptrace_detach(tracer, p))
+					list_add(&p->ptrace_entry, &ptrace_dead);
+			}
+			write_unlock_irq(&tasklist_lock);
+			
+			BUG_ON(!list_empty(&tracer->ptraced);
+			list_for_each_entry_safe(p, n, &ptrace_dead, ptrace_entry) {
+				list_del_init(&p->ptrace_entry);
+				release_task(p);
+			}
+		}
+	
+		这段代码遍历了两个链表：子进程链表和ptrace子进程链表，给每个子进程设置新的父进
+	程。这两个链表同时存在的原因很有意思，它也是2.6内核的一个新特性。当一个进程被跟踪
+	时，它的临时父进程设定为调试进程。此时如果它的父进程退出了，系统会为它和它的所有兄弟重
+	新找一个父进程。在以前的内核中，这就需要遍历系统所有的进程来找这些子进程。现在的解决
+	办法是在一个单独的被ptrace跟踪的子进程链表中搜索相关的兄弟进程————用两个相对较小的链
+	表减轻了遍历带来的消耗。
+	
+		一旦系统为进程成功地找到和设置了新的父进程，就不会再有出现驻留僵死进程的危险了。
+	init进程会例行调用wait()来检查其子进程，清除所有与其相关的僵死进程。
+	
+	
+3.6 小结
+	
+		在本章中，我们考察了系统中的核心概念————进程。我们也讨论了进程的一般特性，
+	它为何如此重要，以及进程与线程之间的关系。然后，讨论了Linux如何存放和表示进程（用
+	task_struct和thread_info），如何创建进程（通过fork()，实际上最终是clone()），如何把新的执
+	行映像装入到地址空间（通过exec()系统调用），如何表示进程的层次关系，父进程又是如
+	何收集其后代的信息（通过wait()系统调用族），以及进程最终如何消亡（强制或自愿地调用
+	exit()）。进程是一个非常基础、非常关键的抽象概念，位于每一种现代操作系统的核心位置，也
+	是我们拥有操作系统（用来运行程序）的最终原因。
+	
+		第4章讨论进程调度，内核以这种微妙而有趣的方式来决定哪个进程运行，何时运行，以何
+	种顺序运行。
 	
 	
 	
 	
 	
+
+*****************************************************************************************
+
+									第4章 进程调度
+								
+*****************************************************************************************
 	
 	
+		第3章讨论了进程，它在操作系统看来是程序的运行态表现形式。本章将讨论进程调度程
+	序，它是确保进程能有效工作的一个内核子系统。
+	
+		调度程序负责决定将哪个进程投入运行，何时运行以及运行多长时间。进程调度程序（常常
+	简称调度程序）可看做在可运行态进程之间分配有限的处理器时间资源的内核子系统。调度程序
+	是像Linux这样多任务操作系统的基础。只有通过调度程序的合理调度，系统资源才能最大限
+	度地发挥作用，多进程才会有并发执行的效果。
+	
+		调度程序没有太复杂的原理。最大限度地利用处理器时间的原则是，只要有可以执行的进
+	程，那么就总会有进程正在执行。但是只要系统中可运行的进程的数目比处理器的个数多，就注
+	定某一给定时刻会有一些进程不能执行。这些进程在等待运行。在一组处于可运行状态的进程中
+	选择一个来执行，是调度程序所需完成的基本工作。
 	
 	
+4.1 多任务
+
+		多任务操作系统就是能同时并发地交互执行多个进程的操作系统。在单处理器机器上，这
+	会产生多个进程在同时运行的幻觉。在多处理器机器上，这会使多个进程在不同的处理机上真正
+	同时、并行地运行。无论在单处理器或者多处理器机器上，多任务操作系统都能使多个进程处于
+	堵塞或者睡眠状态，也就是说，实际上不被投入执行，直到工作确实就绪。这些任务尽管位于内
+	存，但并不处于可运行状态。相反，这些进程利用内核阻塞自己，直到某一事件（键盘输入、网
+	络数据、过一段时间等）发生。因此，现代Linux系统也许有100个进程在内存，但只有一个
+	处于可运行状态。
 	
+		多任务系统可以划分为两类：非抢占式多任务（cooperative multitasking）和抢占式多任务
+	（preemptive multitasking）。像所有Unix的变体和许多其他现代操作系统一样，Linux提供了抢占
+	式的多任务模式。在此模式下，由调度程序来决定什么时候停止一个进程的运行，以便其他进程
+	能够得到执行机会。这个强制的挂起动作就叫做抢占（preemption）。进程在被抢占之前能够运行
+	的时间是预先设置好的，而且有一个专门的名字，叫进程的时间片（timeslice）。时间片实际上
+	就是分配给每个可运行进程的处理器时间段。有效管理时间片能
 	
 	
 	
